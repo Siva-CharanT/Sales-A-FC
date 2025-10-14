@@ -1,0 +1,174 @@
+# SALES ANALYSIS AND FORECASTING (Python)
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import warnings
+from math import sqrt
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+import statsmodels.api as sm
+from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error
+import os
+
+# ---------------- CONFIG ----------------
+np.random.seed(42)
+SAVE_DIR = os.getcwd()   # saves files in the current directory
+h = 12                   # forecast horizon (months)
+warnings.filterwarnings("ignore")
+# ----------------------------------------
+
+print("\nGenerating synthetic monthly sales data...")
+
+# ----- Synthetic dataset -----
+periods = 5 * 12
+date_index = pd.date_range(start="2018-01-01", periods=periods, freq="MS")
+
+trend = np.linspace(200, 500, periods)
+seasonality = 50 * np.sin(2 * np.pi * (np.arange(periods) % 12) / 12)
+noise = np.random.normal(0, 20, periods)
+
+price = 20 + 0.01 * np.arange(periods) + np.random.normal(0, 0.3, periods)
+promotion = np.random.binomial(1, 0.12, periods)
+
+sales = trend + seasonality - 5 * price + 40 * promotion + noise
+sales = np.round(sales).astype(int)
+
+df = pd.DataFrame({
+    "date": date_index,
+    "sales": sales,
+    "price": np.round(price, 2),
+    "promotion": promotion
+})
+df.set_index("date", inplace=True)
+
+# Save data
+sample_csv = os.path.join(SAVE_DIR, "sales_sample.csv")
+df.to_csv(sample_csv)
+print(f"\nSample dataset saved as: {sample_csv}")
+
+# ----- EDA -----
+print("\n--- Head of Data ---")
+print(df.head())
+print("\n--- Summary ---")
+print(df.describe())
+print("\n--- Correlation Matrix ---")
+print(df.corr())
+
+# ----- Plot sales trend -----
+plt.figure(figsize=(10,4))
+plt.plot(df.index, df["sales"], marker='o', linewidth=1)
+plt.title("Monthly Sales Trend")
+plt.xlabel("Date")
+plt.ylabel("Sales")
+plt.tight_layout()
+plt.show()
+
+# ----- Split data -----
+train = df.iloc[:-h].copy()
+test = df.iloc[-h:].copy()
+
+# ----- Baseline forecasts -----
+naive_forecast = pd.Series(float(train["sales"].iloc[-1]), index=test.index)
+
+if len(train) >= 12:
+    seasonal_naive_vals = [train["sales"].iloc[-12 + i] for i in range(len(test))]
+else:
+    seasonal_naive_vals = [train["sales"].iloc[-1]] * len(test)
+seasonal_naive = pd.Series(seasonal_naive_vals, index=test.index, dtype=float)
+
+# ----- Holt-Winters -----
+hw_model = ExponentialSmoothing(train["sales"], trend="add", seasonal="add", seasonal_periods=12)
+hw_fit = hw_model.fit(optimized=True)
+hw_forecast = hw_fit.forecast(h)
+
+# ----- SARIMAX with exogenous variables -----
+exog_train = train[["price", "promotion"]]
+exog_test = test[["price", "promotion"]]
+sarimax_order = (1, 1, 1)
+seasonal_order = (1, 1, 1, 12)
+
+try:
+    sarimax = sm.tsa.statespace.SARIMAX(
+        train["sales"], order=sarimax_order, seasonal_order=seasonal_order,
+        exog=exog_train, enforce_stationarity=False, enforce_invertibility=False
+    )
+    sarimax_fit = sarimax.fit(disp=False)
+    sarimax_forecast = sarimax_fit.get_forecast(steps=h, exog=exog_test)
+    sarimax_pred = sarimax_forecast.predicted_mean
+except Exception as e:
+    print("\nSARIMAX model failed:", e)
+    sarimax_pred = pd.Series(np.nan, index=test.index)
+
+# ----- Evaluation -----
+def evaluate(y_true, y_pred, name):
+    mask = ~pd.isna(y_pred)
+    y_true_v, y_pred_v = y_true[mask], y_pred[mask]
+    if len(y_pred_v) == 0:
+        return {"model": name, "rmse": np.nan, "mape": np.nan}
+    rmse = sqrt(mean_squared_error(y_true_v, y_pred_v))
+    mape = mean_absolute_percentage_error(y_true_v, y_pred_v)
+    print(f"{name}: RMSE={rmse:.2f}, MAPE={mape:.3f}")
+    return {"model": name, "rmse": rmse, "mape": mape}
+
+print("\nEvaluating models...")
+results = [
+    evaluate(test["sales"], naive_forecast, "Naive"),
+    evaluate(test["sales"], seasonal_naive, "Seasonal Naive"),
+    evaluate(test["sales"], hw_forecast, "Holt-Winters"),
+    evaluate(test["sales"], sarimax_pred, "SARIMAX")
+]
+
+results_df = pd.DataFrame(results).set_index("model")
+print("\n--- Model Comparison ---")
+print(results_df)
+
+# ----- Save forecasts -----
+forecast_csv = os.path.join(SAVE_DIR, "sales_forecasts.csv")
+out = pd.DataFrame({
+    "actual": test["sales"],
+    "naive": naive_forecast,
+    "seasonal_naive": seasonal_naive,
+    "holt_winters": hw_forecast,
+    "sarimax": sarimax_pred
+})
+out.to_csv(forecast_csv)
+print(f"\nForecasts saved as: {forecast_csv}")
+
+# ----- Plot actual vs forecast -----
+plt.figure(figsize=(12,5))
+plt.plot(train.index, train["sales"], label="Train")
+plt.plot(test.index, test["sales"], label="Actual", linestyle="--", marker='o')
+plt.plot(test.index, hw_forecast, label="Holt-Winters")
+plt.plot(test.index, sarimax_pred, label="SARIMAX")
+plt.legend()
+plt.title("Forecast Comparison")
+plt.tight_layout()
+plt.show()
+
+# ----- Future forecast (next 12 months) -----
+try:
+    final_model = sm.tsa.statespace.SARIMAX(
+        df["sales"], order=sarimax_order, seasonal_order=seasonal_order,
+        exog=df[["price", "promotion"]],
+        enforce_stationarity=False, enforce_invertibility=False
+    )
+    final_fit = final_model.fit(disp=False)
+    future_index = pd.date_range(start=df.index[-1] + pd.offsets.MonthBegin(1), periods=12, freq="MS")
+    future_price = df["price"].iloc[-12:].values * (1 + 0.005 * np.arange(1, 13))
+    future_promotion = np.random.binomial(1, 0.12, 12)
+    future_exog = pd.DataFrame({"price": future_price, "promotion": future_promotion}, index=future_index)
+    future_forecast = final_fit.get_forecast(steps=12, exog=future_exog)
+    future_pred = future_forecast.predicted_mean.round()
+    future_out = pd.DataFrame({
+        "forecast_sales": future_pred,
+        "price": future_exog["price"],
+        "promotion": future_exog["promotion"]
+    })
+    future_csv = os.path.join(SAVE_DIR, "sales_future_forecast.csv")
+    future_out.to_csv(future_csv)
+    print(f"\nFuture forecast saved as: {future_csv}")
+    print(future_out)
+except Exception as e:
+    print("\nFuture forecast failed:", e)
+
+print("\nAll tasks completed successfully!")
